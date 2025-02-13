@@ -547,8 +547,8 @@ public class KinesisDataFetcher<T> {
         // added by the
         //     consumer using a restored state checkpoint
         for (int seededStateIndex = 0;
-             seededStateIndex < subscribedShardsState.size();
-             seededStateIndex++) {
+                seededStateIndex < subscribedShardsState.size();
+                seededStateIndex++) {
             KinesisStreamShardState seededShardState = subscribedShardsState.get(seededStateIndex);
 
             // only start a consuming thread if the seeded subscribed shard has not been completely
@@ -585,7 +585,7 @@ public class KinesisDataFetcher<T> {
                                 //
                                 // streamShardHandle.getShard().getShardId())
                                 //                                                .addGroup("user")
-                        ));
+                                ));
                 shardConsumersExecutor.submit(
                         createShardConsumer(
                                 seededStateIndex,
@@ -735,7 +735,7 @@ public class KinesisDataFetcher<T> {
                                 //
                                 // streamShardHandle.getShard().getShardId())
                                 //                                                .addGroup("user")
-                        ));
+                                ));
                 shardConsumersExecutor.submit(
                         createShardConsumer(
                                 newStateIndex,
@@ -1163,8 +1163,8 @@ public class KinesisDataFetcher<T> {
             // consider only active shards, or those that would advance the watermark
             if (w != null
                     && (e.getValue().lastUpdated >= idleTime
-                    || e.getValue().emitQueue.getSize() > 0
-                    || w.getTimestamp() > lastWatermark)) {
+                            || e.getValue().emitQueue.getSize() > 0
+                            || w.getTimestamp() > lastWatermark)) {
                 potentialWatermark = Math.min(potentialWatermark, w.getTimestamp());
                 // for sync, use the watermark of the next record, when available
                 // otherwise watermark may stall when record is blocked by synchronization
@@ -1396,7 +1396,7 @@ public class KinesisDataFetcher<T> {
      * @return the initial map for subscribedStreamsToLastDiscoveredShardIds
      */
     protected static HashMap<String, String>
-    createInitialSubscribedStreamsToLastDiscoveredShardsState(List<String> streams) {
+            createInitialSubscribedStreamsToLastDiscoveredShardsState(List<String> streams) {
         HashMap<String, String> initial = new HashMap<>();
         for (String stream : streams) {
             initial.put(stream, null);
