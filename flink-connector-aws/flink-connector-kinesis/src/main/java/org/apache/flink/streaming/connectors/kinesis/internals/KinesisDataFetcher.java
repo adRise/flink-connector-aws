@@ -574,15 +574,18 @@ public class KinesisDataFetcher<T> {
                         RuntimeContextInitializationContextAdapters.deserializationAdapter(
                                 runtimeContext,
                                 // ignore the provided metric group
-                                metricGroup ->
-                                        consumerMetricGroup
-                                                .addGroup(
-                                                        "subtaskId",
-                                                        String.valueOf(indexOfThisConsumerSubtask))
-                                                .addGroup(
-                                                        "shardId",
-                                                        streamShardHandle.getShard().getShardId())
-                                                .addGroup("user")));
+                                metricGroup -> consumerMetricGroup
+                                //                                                .addGroup(
+                                //
+                                // "subtaskId",
+                                //
+                                // String.valueOf(indexOfThisConsumerSubtask))
+                                //                                                .addGroup(
+                                //                                                        "shardId",
+                                //
+                                // streamShardHandle.getShard().getShardId())
+                                //                                                .addGroup("user")
+                                ));
                 shardConsumersExecutor.submit(
                         createShardConsumer(
                                 seededStateIndex,
@@ -721,15 +724,18 @@ public class KinesisDataFetcher<T> {
                         RuntimeContextInitializationContextAdapters.deserializationAdapter(
                                 runtimeContext,
                                 // ignore the provided metric group
-                                metricGroup ->
-                                        consumerMetricGroup
-                                                .addGroup(
-                                                        "subtaskId",
-                                                        String.valueOf(indexOfThisConsumerSubtask))
-                                                .addGroup(
-                                                        "shardId",
-                                                        streamShardHandle.getShard().getShardId())
-                                                .addGroup("user")));
+                                metricGroup -> consumerMetricGroup
+                                //                                                .addGroup(
+                                //
+                                // "subtaskId",
+                                //
+                                // String.valueOf(indexOfThisConsumerSubtask))
+                                //                                                .addGroup(
+                                //                                                        "shardId",
+                                //
+                                // streamShardHandle.getShard().getShardId())
+                                //                                                .addGroup("user")
+                                ));
                 shardConsumersExecutor.submit(
                         createShardConsumer(
                                 newStateIndex,
@@ -1331,13 +1337,13 @@ public class KinesisDataFetcher<T> {
      */
     private MetricGroup registerShardMetricGroup(
             final MetricGroup metricGroup, final KinesisStreamShardState shardState) {
-        return metricGroup
-                .addGroup(
-                        KinesisConsumerMetricConstants.STREAM_METRICS_GROUP,
-                        shardState.getStreamShardHandle().getStreamName())
-                .addGroup(
-                        KinesisConsumerMetricConstants.SHARD_METRICS_GROUP,
-                        shardState.getStreamShardHandle().getShard().getShardId());
+        return metricGroup;
+        //                .addGroup(
+        //                        KinesisConsumerMetricConstants.STREAM_METRICS_GROUP,
+        //                        shardState.getStreamShardHandle().getStreamName())
+        //                .addGroup(
+        //                        KinesisConsumerMetricConstants.SHARD_METRICS_GROUP,
+        //                        shardState.getStreamShardHandle().getShard().getShardId());
     }
 
     // ------------------------------------------------------------------------
