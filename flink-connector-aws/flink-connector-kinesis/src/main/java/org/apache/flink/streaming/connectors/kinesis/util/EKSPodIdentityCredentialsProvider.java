@@ -65,11 +65,13 @@ public class EKSPodIdentityCredentialsProvider implements AWSCredentialsProvider
      *
      * <p>Checks two conditions:
      * 1. Env var {@code AWS_CONTAINER_CREDENTIALS_FULL_URI} is present.
-     * 2. Its value contains {@code 169.254.170.23} (the EKS Pod Identity link-local IP).
+     * 2. Its value contains {@code 169.254.170.23} (the fixed link-local IP of the EKS Pod
+     *    Identity agent).
      *
-     * <p>EKS Pod Identity automatically injects this env var into pods. Non-EKS environments
-     * (local dev, Rancher, IRSA) will not have it, so this check reliably detects whether the
-     * pod is running under Pod Identity without affecting other credential flows.
+     * <p>Both conditions must be true. Note that ECS also sets
+     * {@code AWS_CONTAINER_CREDENTIALS_FULL_URI} but points to a different IP ({@code
+     * 169.254.170.2}), so the IP check distinguishes EKS Pod Identity from all other credential
+     * environments (local dev, Rancher, IRSA, ECS) without affecting their credential flows.
      */
     public static boolean isAvailable() {
         String uri = System.getenv(POD_IDENTITY_URI_ENV);
