@@ -192,6 +192,12 @@ public class AWSUtil {
                         .build();
 
             case AUTO:
+                // EKS Pod Identity injects http://169.254.170.23/v1/credentials which is rejected
+                // by the shaded AWS SDK v1 EC2ContainerCredentialsProviderWrapper (non-loopback,
+                // non-HTTPS URI). Use EKSPodIdentityCredentialsProvider first when detected.
+                if (EKSPodIdentityCredentialsProvider.isAvailable()) {
+                    return EKSPodIdentityCredentialsProvider.INSTANCE;
+                }
                 return new DefaultAWSCredentialsProviderChain();
 
             default:
