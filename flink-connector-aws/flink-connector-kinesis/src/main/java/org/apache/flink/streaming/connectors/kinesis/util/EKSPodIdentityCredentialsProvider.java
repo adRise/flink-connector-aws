@@ -22,56 +22,49 @@ package org.apache.flink.streaming.connectors.kinesis.util;
 import com.amazonaws.auth.AWSCredentials;
 import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.BasicSessionCredentials;
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.time.Instant;
+import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
+import software.amazon.awssdk.auth.credentials.ContainerCredentialsProvider;
 
 /**
- * AWS credentials provider that supports EKS Pod Identity.
+ * AWS credentials provider that supports EKS Pod Identity by delegating to the AWS SDK v2 {@link
+ * ContainerCredentialsProvider}, which natively handles EKS Pod Identity including credential
+ * refresh, thread safety, retry, and timeout. The v2 credentials are then adapted to the v1 {@link
+ * AWSCredentialsProvider} interface required by flink-connector-kinesis.
  *
- * <p>EKS Pod Identity injects AWS_CONTAINER_CREDENTIALS_FULL_URI=http://169.254.170.23/v1/credentials
- * into pods. The default AWS SDK v1 EC2ContainerCredentialsProviderWrapper rejects this URI
- * because it is not a loopback address and not HTTPS. This provider calls the endpoint directly
- * using java.net.HttpURLConnection, bypassing that validation.
+ * <p>Background: EKS Pod Identity injects credentials via {@code
+ * http://169.254.170.23/v1/credentials}. The shaded AWS SDK v1 {@code
+ * EC2ContainerCredentialsProviderWrapper} rejects this URI because it is non-loopback and
+ * non-HTTPS. SDK v2's {@link ContainerCredentialsProvider} does not have this restriction.
  */
 public class EKSPodIdentityCredentialsProvider implements AWSCredentialsProvider {
 
-    public static final EKSPodIdentityCredentialsProvider INSTANCE = new EKSPodIdentityCredentialsProvider();
-
-    private static final Logger LOG = LoggerFactory.getLogger(EKSPodIdentityCredentialsProvider.class);
+    public static final EKSPodIdentityCredentialsProvider INSTANCE =
+            new EKSPodIdentityCredentialsProvider();
 
     private static final String POD_IDENTITY_URI_ENV = "AWS_CONTAINER_CREDENTIALS_FULL_URI";
-    private static final String POD_IDENTITY_TOKEN_ENV = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE";
-    private static final String POD_IDENTITY_HOST = "169.254.170.23";
-    // Refresh credentials 300 seconds (5 minutes) before expiration, matching the buffer used
-    // by AWS SDK's own providers (e.g. STSAssumeRoleSessionCredentialsProvider). EKS Pod Identity
-    // credentials are temporary STS credentials with an expiration (typically a few hours).
-    // Without proactive refresh, long-running Flink jobs would eventually hit ExpiredTokenException.
-    private static final int REFRESH_BUFFER_SECONDS = 300;
-    private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    private volatile BasicSessionCredentials credentials;
-    private volatile Instant expiration;
+    // Fixed link-local IP of the EKS Pod Identity agent, defined by AWS.
+    // ECS also sets AWS_CONTAINER_CREDENTIALS_FULL_URI but uses 169.254.170.2,
+    // so this IP distinguishes EKS Pod Identity from all other credential environments.
+    private static final String POD_IDENTITY_HOST = "169.254.170.23";
+
+    private final ContainerCredentialsProvider v2Provider;
+
+    private EKSPodIdentityCredentialsProvider() {
+        this.v2Provider = ContainerCredentialsProvider.builder().build();
+    }
 
     /**
      * Returns true if EKS Pod Identity environment is detected.
      *
-     * <p>Checks two conditions:
-     * 1. Env var {@code AWS_CONTAINER_CREDENTIALS_FULL_URI} is present.
-     * 2. Its value contains {@code 169.254.170.23} (the fixed link-local IP of the EKS Pod
-     *    Identity agent).
+     * <p>Checks two conditions: 1. Env var {@code AWS_CONTAINER_CREDENTIALS_FULL_URI} is present.
+     * 2. Its value contains {@code 169.254.170.23} (the fixed link-local IP of the EKS Pod Identity
+     * agent).
      *
-     * <p>Both conditions must be true. Note that ECS also sets
-     * {@code AWS_CONTAINER_CREDENTIALS_FULL_URI} but points to a different IP ({@code
-     * 169.254.170.2}), so the IP check distinguishes EKS Pod Identity from all other credential
-     * environments (local dev, Rancher, IRSA, ECS) without affecting their credential flows.
+     * <p>Both conditions must be true. Note that ECS also sets {@code
+     * AWS_CONTAINER_CREDENTIALS_FULL_URI} but points to a different IP ({@code 169.254.170.2}), so
+     * this check reliably detects EKS Pod Identity without affecting other credential flows (local
+     * dev, Rancher, IRSA, ECS).
      */
     public static boolean isAvailable() {
         String uri = System.getenv(POD_IDENTITY_URI_ENV);
@@ -80,66 +73,16 @@ public class EKSPodIdentityCredentialsProvider implements AWSCredentialsProvider
 
     @Override
     public AWSCredentials getCredentials() {
-        if (needsRefresh()) {
-            refresh();
-        }
-        return credentials;
+        // Delegate to SDK v2 ContainerCredentialsProvider which handles credential refresh,
+        // thread safety, retry, and timeout out of the box.
+        AwsSessionCredentials creds = (AwsSessionCredentials) v2Provider.resolveCredentials();
+        return new BasicSessionCredentials(
+                creds.accessKeyId(), creds.secretAccessKey(), creds.sessionToken());
     }
 
     @Override
     public void refresh() {
-        String uri = System.getenv(POD_IDENTITY_URI_ENV);
-        if (uri == null) {
-            throw new RuntimeException(POD_IDENTITY_URI_ENV + " environment variable not set");
-        }
-        try {
-            HttpURLConnection conn = (HttpURLConnection) new URL(uri).openConnection();
-            conn.setRequestMethod("GET");
-            conn.setConnectTimeout(2000);
-            conn.setReadTimeout(2000);
-
-            // Pod Identity requires the authorization token from a file
-            String tokenFile = System.getenv(POD_IDENTITY_TOKEN_ENV);
-            if (tokenFile != null) {
-                String token = new String(java.nio.file.Files.readAllBytes(java.nio.file.Paths.get(tokenFile))).trim();
-                conn.setRequestProperty("Authorization", token);
-            }
-
-            int status = conn.getResponseCode();
-            if (status != 200) {
-                throw new RuntimeException("Pod Identity endpoint returned HTTP " + status);
-            }
-
-            StringBuilder sb = new StringBuilder();
-            try (BufferedReader br = new BufferedReader(new InputStreamReader(conn.getInputStream()))) {
-                String line;
-                while ((line = br.readLine()) != null) {
-                    sb.append(line);
-                }
-            }
-
-            JsonNode node = MAPPER.readTree(sb.toString());
-            String accessKeyId = node.get("AccessKeyId").asText();
-            String secretAccessKey = node.get("SecretAccessKey").asText();
-            String sessionToken = node.get("Token").asText();
-            String expirationStr = node.path("Expiration").asText(null);
-
-            credentials = new BasicSessionCredentials(accessKeyId, secretAccessKey, sessionToken);
-            expiration = expirationStr != null ? Instant.parse(expirationStr) : Instant.now().plusSeconds(3600);
-
-            LOG.debug("Successfully refreshed EKS Pod Identity credentials, expiration: {}", expiration);
-
-        } catch (Exception e) {
-            throw new RuntimeException("Failed to retrieve EKS Pod Identity credentials from " + uri, e);
-        }
-    }
-
-    // Lazy refresh: checked on every getCredentials() call (which the AWS SDK invokes before
-    // each API request). No background thread needed — this is sufficient because the SDK
-    // calls getCredentials() frequently enough to catch the refresh window.
-    private boolean needsRefresh() {
-        return credentials == null
-                || expiration == null
-                || Instant.now().isAfter(expiration.minusSeconds(REFRESH_BUFFER_SECONDS));
+        // Intentionally empty — refresh is handled automatically by the SDK v2
+        // ContainerCredentialsProvider via its internal CachedSupplier.
     }
 }
