@@ -50,6 +50,10 @@ public class EKSPodIdentityCredentialsProvider implements AWSCredentialsProvider
     private static final String POD_IDENTITY_URI_ENV = "AWS_CONTAINER_CREDENTIALS_FULL_URI";
     private static final String POD_IDENTITY_TOKEN_ENV = "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE";
     private static final String POD_IDENTITY_HOST = "169.254.170.23";
+    // Refresh credentials 60 seconds before expiration to avoid using expired credentials
+    // at the moment of an API call. EKS Pod Identity credentials are temporary STS credentials
+    // with an expiration (typically a few hours). Without proactive refresh, long-running Flink
+    // jobs would eventually hit ExpiredTokenException. AWS SDK's own providers use the same pattern.
     private static final int REFRESH_BUFFER_SECONDS = 60;
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -118,6 +122,9 @@ public class EKSPodIdentityCredentialsProvider implements AWSCredentialsProvider
         }
     }
 
+    // Lazy refresh: checked on every getCredentials() call (which the AWS SDK invokes before
+    // each API request). No background thread needed — this is sufficient because the SDK
+    // calls getCredentials() frequently enough to catch the refresh window.
     private boolean needsRefresh() {
         return credentials == null
                 || expiration == null
