@@ -60,7 +60,17 @@ public class EKSPodIdentityCredentialsProvider implements AWSCredentialsProvider
     private volatile BasicSessionCredentials credentials;
     private volatile Instant expiration;
 
-    /** Returns true if EKS Pod Identity environment is detected. */
+    /**
+     * Returns true if EKS Pod Identity environment is detected.
+     *
+     * <p>Checks two conditions:
+     * 1. Env var {@code AWS_CONTAINER_CREDENTIALS_FULL_URI} is present.
+     * 2. Its value contains {@code 169.254.170.23} (the EKS Pod Identity link-local IP).
+     *
+     * <p>EKS Pod Identity automatically injects this env var into pods. Non-EKS environments
+     * (local dev, Rancher, IRSA) will not have it, so this check reliably detects whether the
+     * pod is running under Pod Identity without affecting other credential flows.
+     */
     public static boolean isAvailable() {
         String uri = System.getenv(POD_IDENTITY_URI_ENV);
         return uri != null && uri.contains(POD_IDENTITY_HOST);
