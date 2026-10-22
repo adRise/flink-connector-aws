@@ -64,6 +64,12 @@ jobs:
       FLINK_AWS_PASSWORD: ${{ secrets.FLINK_AWS_PASSWORD }}
       HAS_AWS_CREDS: ${{ secrets.FLINK_AWS_USER != '' && secrets.FLINK_AWS_PASSWORD != '' }}
     steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+        with:
+          use-policy-store: true
+          api-key: ${{ secrets.STEP_SECURITY_API_KEY }}
+
       - run: echo "Running CI pipeline for JDK version ${{ matrix.jdk }}"
 
       - name: Check out repository code
