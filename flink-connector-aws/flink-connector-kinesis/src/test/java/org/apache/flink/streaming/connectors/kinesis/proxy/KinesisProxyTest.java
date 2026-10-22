@@ -35,9 +35,12 @@ import com.amazonaws.services.kinesis.model.DescribeStreamRequest;
 import com.amazonaws.services.kinesis.model.DescribeStreamResult;
 import com.amazonaws.services.kinesis.model.ExpiredIteratorException;
 import com.amazonaws.services.kinesis.model.GetRecordsResult;
+import com.amazonaws.services.kinesis.model.GetShardIteratorRequest;
+import com.amazonaws.services.kinesis.model.GetShardIteratorResult;
 import com.amazonaws.services.kinesis.model.ListShardsRequest;
 import com.amazonaws.services.kinesis.model.ListShardsResult;
 import com.amazonaws.services.kinesis.model.ProvisionedThroughputExceededException;
+import com.amazonaws.services.kinesis.model.ResourceNotFoundException;
 import com.amazonaws.services.kinesis.model.Shard;
 import com.amazonaws.services.kinesis.model.StreamDescription;
 import com.amazonaws.services.kinesis.model.StreamStatus;
@@ -47,6 +50,7 @@ import org.apache.http.conn.ConnectTimeoutException;
 import org.hamcrest.Description;
 import org.hamcrest.TypeSafeDiagnosingMatcher;
 import org.junit.Test;
+import org.mockito.ArgumentCaptor;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 import org.powermock.reflect.Whitebox;
@@ -63,6 +67,13 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Properties;
 import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -74,6 +85,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Matchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.mockito.hamcrest.MockitoHamcrest.argThat;
@@ -552,9 +564,175 @@ public class KinesisProxyTest {
         }
     }
 
+    // The tests below use a stream name of their own so that the JVM-wide ARN cache never carries
+    // an entry from another test into them.
+
+    @Test
+    public void testStreamArnIsDescribedOncePerJvmNotOncePerProxy() throws Exception {
+        final String streamName = "describe-once-" + UUID.randomUUID();
+        final String streamArn = "arn:aws:kinesis:us-east-1:123456789012:stream/" + streamName;
+        AmazonKinesis mockClient = mock(AmazonKinesis.class);
+        when(mockClient.describeStream(getDescribeStreamRequest(streamName)))
+                .thenReturn(getDescribeStreamResult(streamArn));
+        when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+                .thenReturn(new GetShardIteratorResult().withShardIterator("iterator"));
+
+        // The polling record publisher creates one KinesisProxy for every shard it reads.
+        final int shards = 100;
+        for (int shard = 0; shard < shards; shard++) {
+            getProxy(mockClient).getShardIterator(shardHandle(streamName, shard), "LATEST", null);
+        }
+
+        verify(mockClient, times(1)).describeStream(any(DescribeStreamRequest.class));
+        ArgumentCaptor<GetShardIteratorRequest> requests =
+                ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+        verify(mockClient, times(shards)).getShardIterator(requests.capture());
+        assertThat(requests.getAllValues())
+                .extracting(GetShardIteratorRequest::getStreamARN)
+                .containsOnly(streamArn);
+    }
+
+    @Test
+    public void testConcurrentProxiesShareOneDescribeStreamCall() throws Exception {
+        final String streamName = "describe-once-concurrent-" + UUID.randomUUID();
+        final String streamArn = "arn:aws:kinesis:us-east-1:123456789012:stream/" + streamName;
+        final AtomicInteger describeCalls = new AtomicInteger();
+        AmazonKinesis mockClient = mock(AmazonKinesis.class);
+        when(mockClient.describeStream(any(DescribeStreamRequest.class)))
+                .thenAnswer(
+                        invocation -> {
+                            describeCalls.incrementAndGet();
+                            // Long enough for every other thread to be waiting for the answer.
+                            Thread.sleep(300);
+                            return getDescribeStreamResult(streamArn);
+                        });
+        when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+                .thenReturn(new GetShardIteratorResult().withShardIterator("iterator"));
+
+        final int threads = 16;
+        final CountDownLatch start = new CountDownLatch(1);
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try {
+            List<Future<String>> results = new ArrayList<>();
+            for (int shard = 0; shard < threads; shard++) {
+                final KinesisProxy proxy = getProxy(mockClient);
+                final StreamShardHandle handle = shardHandle(streamName, shard);
+                results.add(
+                        executor.submit(
+                                () -> {
+                                    start.await();
+                                    return proxy.getShardIterator(handle, "LATEST", null);
+                                }));
+            }
+            start.countDown();
+            for (Future<String> result : results) {
+                assertThat(result.get(30, TimeUnit.SECONDS)).isEqualTo("iterator");
+            }
+        } finally {
+            executor.shutdownNow();
+        }
+
+        assertThat(describeCalls.get()).isEqualTo(1);
+    }
+
+    @Test
+    public void testSubtaskProxiesListingShardsShareOneDescribeStreamCall() throws Exception {
+        final String streamName = "describe-once-list-" + UUID.randomUUID();
+        final String streamArn = "arn:aws:kinesis:us-east-1:123456789012:stream/" + streamName;
+        AmazonKinesis mockClient = mock(AmazonKinesis.class);
+        when(mockClient.describeStream(getDescribeStreamRequest(streamName)))
+                .thenReturn(getDescribeStreamResult(streamArn));
+        doReturn(
+                        new ListShardsResult()
+                                .withShards(new Shard().withShardId("shardId-000000000000"))
+                                .withNextToken(null))
+                .when(mockClient)
+                .listShards(any(ListShardsRequest.class));
+
+        // Every subtask's fetcher has a proxy of its own and lists the shards with it.
+        for (int subtask = 0; subtask < 50; subtask++) {
+            GetShardListResult result =
+                    getProxy(mockClient)
+                            .getShardList(
+                                    createInitialSubscribedStreamsToLastDiscoveredShardsState(
+                                            Collections.singletonList(streamName)));
+            assertThat(result.hasRetrievedShards()).isTrue();
+        }
+
+        verify(mockClient, times(1)).describeStream(any(DescribeStreamRequest.class));
+    }
+
+    @Test
+    public void testStreamArnIsLookedUpAgainForAnotherRegion() throws Exception {
+        final String streamName = "describe-once-region-" + UUID.randomUUID();
+        AmazonKinesis eastClient = mock(AmazonKinesis.class);
+        AmazonKinesis westClient = mock(AmazonKinesis.class);
+        when(eastClient.describeStream(getDescribeStreamRequest(streamName)))
+                .thenReturn(
+                        getDescribeStreamResult(
+                                "arn:aws:kinesis:us-east-1:123456789012:stream/" + streamName));
+        when(westClient.describeStream(getDescribeStreamRequest(streamName)))
+                .thenReturn(
+                        getDescribeStreamResult(
+                                "arn:aws:kinesis:us-west-2:123456789012:stream/" + streamName));
+        when(eastClient.getShardIterator(any(GetShardIteratorRequest.class)))
+                .thenReturn(new GetShardIteratorResult().withShardIterator("iterator"));
+        when(westClient.getShardIterator(any(GetShardIteratorRequest.class)))
+                .thenReturn(new GetShardIteratorResult().withShardIterator("iterator"));
+
+        getProxy(eastClient, "us-east-1")
+                .getShardIterator(shardHandle(streamName, 0), "LATEST", null);
+        getProxy(westClient, "us-west-2")
+                .getShardIterator(shardHandle(streamName, 0), "LATEST", null);
+
+        // A stream of the same name in another region is another stream.
+        verify(eastClient, times(1)).describeStream(any(DescribeStreamRequest.class));
+        verify(westClient, times(1)).describeStream(any(DescribeStreamRequest.class));
+        ArgumentCaptor<GetShardIteratorRequest> west =
+                ArgumentCaptor.forClass(GetShardIteratorRequest.class);
+        verify(westClient).getShardIterator(west.capture());
+        assertThat(west.getValue().getStreamARN()).contains("us-west-2");
+    }
+
+    @Test
+    public void testFailedStreamArnLookupIsNotCached() throws Exception {
+        final String streamName = "describe-once-failure-" + UUID.randomUUID();
+        final String streamArn = "arn:aws:kinesis:us-east-1:123456789012:stream/" + streamName;
+        AmazonKinesis mockClient = mock(AmazonKinesis.class);
+        when(mockClient.describeStream(getDescribeStreamRequest(streamName)))
+                .thenThrow(new ResourceNotFoundException("not there yet"))
+                .thenReturn(getDescribeStreamResult(streamArn));
+        when(mockClient.getShardIterator(any(GetShardIteratorRequest.class)))
+                .thenReturn(new GetShardIteratorResult().withShardIterator("iterator"));
+
+        assertThatThrownBy(
+                        () ->
+                                getProxy(mockClient)
+                                        .getShardIterator(
+                                                shardHandle(streamName, 0), "LATEST", null))
+                .isInstanceOf(RuntimeException.class);
+        assertThat(
+                        getProxy(mockClient)
+                                .getShardIterator(shardHandle(streamName, 1), "LATEST", null))
+                .isEqualTo("iterator");
+
+        verify(mockClient, times(2)).describeStream(any(DescribeStreamRequest.class));
+    }
+
+    private StreamShardHandle shardHandle(String streamName, int shardOrder) {
+        return new StreamShardHandle(
+                streamName,
+                new Shard()
+                        .withShardId(KinesisShardIdGenerator.generateFromShardOrder(shardOrder)));
+    }
+
     private KinesisProxy getProxy(AmazonKinesis awsKinesis) {
+        return getProxy(awsKinesis, "us-east-1");
+    }
+
+    private KinesisProxy getProxy(AmazonKinesis awsKinesis, String region) {
         Properties kinesisConsumerConfig = new Properties();
-        kinesisConsumerConfig.setProperty(ConsumerConfigConstants.AWS_REGION, "us-east-1");
+        kinesisConsumerConfig.setProperty(ConsumerConfigConstants.AWS_REGION, region);
         kinesisConsumerConfig.setProperty(
                 ConsumerConfigConstants.AWS_ACCESS_KEY_ID, "fake_accesskey");
         kinesisConsumerConfig.setProperty(
