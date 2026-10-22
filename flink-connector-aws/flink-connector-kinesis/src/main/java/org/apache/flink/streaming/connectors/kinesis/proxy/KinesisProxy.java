@@ -59,6 +59,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -141,8 +142,24 @@ public class KinesisProxy implements KinesisProxyInterface {
     /** Exponential backoff power constant for the describe stream operation. */
     private final double describeStreamExpConstant;
 
-    /** Caches retrieved stream ARNs for give stream names. */
-    private final Map<String, String> streamNameToArnLookup = new ConcurrentHashMap<>();
+    /**
+     * Stream ARNs found with {@code DescribeStream}, shared by every proxy of the JVM.
+     *
+     * <p>The polling record publisher creates a proxy for every shard it reads, and each one needs
+     * the stream ARN for its {@code GetShardIterator} calls. With a cache per proxy that was one
+     * {@code DescribeStream} per shard at start: about 9000 calls on a 9000-shard stream against an
+     * account quota of about 10 per second, each retried on {@code LimitExceededException} until it
+     * got through, so the shards started at a trickle. The ARN of a stream does not change, so one
+     * lookup per JVM is enough. The key (see {@link #streamArnScope}) separates what could answer
+     * differently: proxy class, region, endpoint and credentials.
+     */
+    private static final ConcurrentMap<String, String> STREAM_ARNS = new ConcurrentHashMap<>();
+
+    /** One lock per key of {@link #STREAM_ARNS}, so concurrent proxies wait for the lookup. */
+    private static final ConcurrentMap<String, Object> STREAM_ARN_LOCKS = new ConcurrentHashMap<>();
+
+    /** The part of the {@link #STREAM_ARNS} key that comes from this proxy's configuration. */
+    private final String streamArnScope;
 
     /**
      * Create a new KinesisProxy based on the supplied configuration properties.
@@ -152,6 +169,17 @@ public class KinesisProxy implements KinesisProxyInterface {
     protected KinesisProxy(Properties configProps) {
         checkNotNull(configProps);
         KinesisConfigUtil.backfillConsumerKeys(configProps);
+
+        this.streamArnScope =
+                String.join(
+                        "|",
+                        getClass().getName(),
+                        configProps.getProperty(ConsumerConfigConstants.AWS_REGION, ""),
+                        configProps.getProperty(ConsumerConfigConstants.AWS_ENDPOINT, ""),
+                        configProps.getProperty(
+                                ConsumerConfigConstants.AWS_CREDENTIALS_PROVIDER, ""),
+                        configProps.getProperty(ConsumerConfigConstants.AWS_ROLE_ARN, ""),
+                        configProps.getProperty(ConsumerConfigConstants.AWS_ACCESS_KEY_ID, ""));
 
         this.kinesisClient = createKinesisClient(configProps);
 
@@ -495,13 +523,22 @@ public class KinesisProxy implements KinesisProxyInterface {
         return shardsOfStream;
     }
 
-    private synchronized String lookupStreamArn(String streamName) throws InterruptedException {
-        if (streamNameToArnLookup.containsKey(streamName)) {
-            return streamNameToArnLookup.get(streamName);
+    private String lookupStreamArn(String streamName) throws InterruptedException {
+        final String key = streamArnScope + "|" + streamName;
+        String streamArn = STREAM_ARNS.get(key);
+        if (streamArn != null) {
+            return streamArn;
         }
-        String streamArn = describeStream(streamName, null).getStreamDescription().getStreamARN();
-        streamNameToArnLookup.put(streamName, streamArn);
-        return streamArn;
+        // A failed lookup throws before anything is stored, so the next caller tries again.
+        synchronized (STREAM_ARN_LOCKS.computeIfAbsent(key, k -> new Object())) {
+            streamArn = STREAM_ARNS.get(key);
+            if (streamArn == null) {
+                streamArn =
+                        describeStream(streamName, null).getStreamDescription().getStreamARN();
+                STREAM_ARNS.put(key, streamArn);
+            }
+            return streamArn;
+        }
     }
 
     /**
