@@ -77,16 +77,23 @@ public class FanOutKinesisShardSubscription {
 
     private final Duration subscriptionTimeout;
 
-    // Queue is meant for eager retrieval of records from the Kinesis stream. We will always have 2
-    // record batches available on next read.
-    private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>(2);
+    /** Number of record batches that may be requested from the stream or waiting in the queue. */
+    private static final int MAX_BUFFERED_EVENTS = 2;
+
+    // Queue is meant for eager retrieval of records from the Kinesis stream. It is bounded by
+    // demand, not by capacity: a batch is requested from the stream only when one has been
+    // consumed (see nextEvent), so about MAX_BUFFERED_EVENTS batches are available on next read.
+    // It must never block the thread that delivers events: that is a Netty event loop shared with
+    // other shards of the same connection, and a blocked event loop also stops the responses to
+    // the subscribe calls that would let the reader consume the queue again.
+    private final BlockingQueue<SubscribeToShardEvent> eventQueue = new LinkedBlockingQueue<>();
     private final AtomicBoolean subscriptionActive = new AtomicBoolean(false);
     private final AtomicReference<Throwable> subscriptionException = new AtomicReference<>();
 
     // Store the current starting position for this subscription. Will be updated each time new
     // batch of records is consumed
-    private StartingPosition startingPosition;
-    private FanOutShardSubscriber shardSubscriber;
+    private volatile StartingPosition startingPosition;
+    private volatile FanOutShardSubscriber shardSubscriber;
 
     public FanOutKinesisShardSubscription(
             AsyncStreamProxy kinesis,
@@ -116,17 +123,21 @@ public class FanOutKinesisShardSubscription {
         // We have to use our own CountDownLatch to wait for subscription to be acquired because
         // subscription event is tracked via the handler.
         CountDownLatch waitForSubscriptionLatch = new CountDownLatch(1);
-        shardSubscriber = new FanOutShardSubscriber(waitForSubscriptionLatch);
+        // The stream gets its own subscriber. Reading the field when the stream connects would hand
+        // a later activation's subscriber to an earlier stream.
+        final FanOutShardSubscriber subscriber =
+                new FanOutShardSubscriber(waitForSubscriptionLatch);
+        shardSubscriber = subscriber;
         SubscribeToShardResponseHandler responseHandler =
                 SubscribeToShardResponseHandler.builder()
-                        .subscriber(() -> shardSubscriber)
+                        .subscriber(() -> subscriber)
                         .onError(
                                 throwable -> {
                                     // Errors that occur when obtaining a subscription are thrown
                                     // here.
                                     // After subscription is acquired, these errors can be ignored.
                                     if (waitForSubscriptionLatch.getCount() > 0) {
-                                        terminateSubscription(throwable);
+                                        terminateSubscription(subscriber, throwable);
                                         waitForSubscriptionLatch.countDown();
                                     }
                                 })
@@ -150,7 +161,7 @@ public class FanOutKinesisShardSubscription {
                                     startingPosition,
                                     consumerArn,
                                     throwable);
-                            terminateSubscription(throwable);
+                            terminateSubscription(subscriber, throwable);
                             return null;
                         });
 
@@ -167,8 +178,8 @@ public class FanOutKinesisShardSubscription {
                                     startingPosition,
                                     consumerArn);
                             subscriptionActive.set(true);
-                            // Request first batch of records.
-                            shardSubscriber.requestRecords();
+                            // Request the first batches of records.
+                            subscriber.requestInitialRecords();
                         } else {
                             String errorMessage =
                                     "Timeout when subscribing to shard "
@@ -179,23 +190,23 @@ public class FanOutKinesisShardSubscription {
                                             + consumerArn
                                             + ".";
                             LOG.error(errorMessage);
-                            terminateSubscription(new TimeoutException(errorMessage));
+                            terminateSubscription(subscriber, new TimeoutException(errorMessage));
                         }
                     } catch (InterruptedException e) {
                         LOG.warn("Interrupted while waiting for subscription to complete.", e);
-                        terminateSubscription(e);
+                        terminateSubscription(subscriber, e);
                         Thread.currentThread().interrupt();
                     }
                 });
     }
 
-    private void terminateSubscription(Throwable t) {
+    private void terminateSubscription(FanOutShardSubscriber subscriber, Throwable t) {
         if (!subscriptionException.compareAndSet(null, t)) {
             LOG.warn(
                     "Another subscription exception has been queued, ignoring subsequent exceptions",
                     t);
         }
-        shardSubscriber.cancel();
+        subscriber.cancel();
     }
 
     /**
@@ -237,15 +248,23 @@ public class FanOutKinesisShardSubscription {
                     "Subscription encountered unrecoverable exception.", throwable);
         }
 
+        // Events that arrived before the subscription went inactive are still valid and in order:
+        // the next subscription starts after the last of them. Leaving them in a full queue until
+        // the subscription is active again is what used to park the thread that delivers events.
+        SubscribeToShardEvent event = eventQueue.poll();
+        if (event != null) {
+            // Replace the batch just consumed.
+            shardSubscriber.requestRecords();
+            return event;
+        }
+
         if (!subscriptionActive.get()) {
             LOG.debug(
                     "Subscription to shard {} for consumer {} is not yet active. Skipping.",
                     shardId,
                     consumerArn);
-            return null;
         }
-
-        return eventQueue.poll();
+        return null;
     }
 
     /**
@@ -255,14 +274,24 @@ public class FanOutKinesisShardSubscription {
     private class FanOutShardSubscriber implements Subscriber<SubscribeToShardEventStream> {
         private final CountDownLatch subscriptionLatch;
 
-        private Subscription subscription;
+        private volatile Subscription subscription;
 
         private FanOutShardSubscriber(CountDownLatch subscriptionLatch) {
             this.subscriptionLatch = subscriptionLatch;
         }
 
         public void requestRecords() {
-            subscription.request(1);
+            // Not yet subscribed: the initial request covers it.
+            Subscription current = subscription;
+            if (current != null) {
+                current.request(1);
+            }
+        }
+
+        private void requestInitialRecords() {
+            for (int i = 0; i < MAX_BUFFERED_EVENTS; i++) {
+                requestRecords();
+            }
         }
 
         public void cancel() {
@@ -293,27 +322,32 @@ public class FanOutKinesisShardSubscription {
                     new SubscribeToShardResponseHandler.Visitor() {
                         @Override
                         public void visit(SubscribeToShardEvent event) {
-                            try {
-                                LOG.debug(
-                                        "Received event: {}, {}",
-                                        event.getClass().getSimpleName(),
-                                        event);
-                                eventQueue.put(event);
-
-                                // Update the starting position in case we have to recreate the
-                                // subscription
-                                startingPosition =
-                                        StartingPosition.continueFromSequenceNumber(
-                                                event.continuationSequenceNumber());
-
-                                // Replace the record just consumed in the Queue
-                                requestRecords();
-                            } catch (InterruptedException e) {
-                                Thread.currentThread().interrupt();
-                                throw new KinesisStreamsSourceException(
-                                        "Interrupted while adding Kinesis record to internal buffer.",
-                                        e);
+                            if (shardSubscriber != FanOutShardSubscriber.this) {
+                                // A stream that was replaced by a newer subscription: the newer
+                                // one starts after the last event that was queued, so these
+                                // events would be delivered twice, and out of order.
+                                LOG.warn(
+                                        "Dropping an event of a replaced subscription to shard {} for consumer {}.",
+                                        shardId,
+                                        consumerArn);
+                                Subscription replaced = subscription;
+                                if (replaced != null) {
+                                    replaced.cancel();
+                                }
+                                return;
                             }
+                            LOG.debug(
+                                    "Received event: {}, {}",
+                                    event.getClass().getSimpleName(),
+                                    event);
+                            // Never blocks: the demand, not the queue, limits what is in flight.
+                            eventQueue.add(event);
+
+                            // Update the starting position in case we have to recreate the
+                            // subscription
+                            startingPosition =
+                                    StartingPosition.continueFromSequenceNumber(
+                                            event.continuationSequenceNumber());
                         }
                     });
         }
