@@ -289,7 +289,11 @@ public class FanOutKinesisShardSubscription {
         }
 
         private void requestInitialRecords() {
-            for (int i = 0; i < MAX_BUFFERED_EVENTS; i++) {
+            // Batches the stream before left in the queue count against the same limit. Asking
+            // for the full amount on every new stream would grow the queue by that much each time
+            // a stream is replaced while the reader is not polling.
+            int room = MAX_BUFFERED_EVENTS - eventQueue.size();
+            for (int i = 0; i < room; i++) {
                 requestRecords();
             }
         }

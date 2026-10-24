@@ -240,12 +240,12 @@ class FanOutKinesisShardSubscriptionTest {
         first.deliver("2");
 
         // The stream ends with two events still queued and nobody polling. The events of the
-        // replacement stream must not wait for the reader either.
+        // replacement stream must not wait for the reader either, even if more arrive than it
+        // asked for (it asks for nothing: the queue is full).
         proxy.connectAtOnce = false;
         first.subscriber.onComplete();
         eventually(() -> proxy.streams.size() == 2, "the second subscribe call");
         proxy.streams.get(1).connect();
-        eventually(() -> proxy.streams.get(1).requested.get() == 2, "the second stream's requests");
         ExecutorService eventLoop = Executors.newSingleThreadExecutor();
         try {
             Future<?> delivered =
@@ -266,6 +266,37 @@ class FanOutKinesisShardSubscriptionTest {
     }
 
     @Test
+    void aReplacementStreamAsksOnlyForWhatTheQueueStillHasRoomFor() throws Exception {
+        ControlledProxy proxy = new ControlledProxy();
+        FanOutKinesisShardSubscription subscription = subscriptionOn(proxy);
+        subscription.activateSubscription();
+        eventually(() -> proxy.streams.get(0).requested.get() == 2, "the first two requests");
+        proxy.streams.get(0).deliver("1");
+        proxy.streams.get(0).deliver("2");
+
+        // Nobody polls (the job is held up downstream) while the stream is replaced, which
+        // happens every few minutes. The queue holds all the batches the subscription may keep:
+        // a replacement that asked for two more every time would grow it for as long as the job
+        // is held up.
+        for (int i = 1; i <= 3; i++) {
+            final int streams = i + 1;
+            proxy.streams.get(i - 1).subscriber.onComplete();
+            eventually(() -> proxy.streams.size() == streams, "the next subscribe call");
+            // The subscription is marked active, and the requests are made, on another thread
+            // once the stream has connected. A real stream lives for minutes before it ends.
+            Thread.sleep(100);
+        }
+        Stream last = proxy.streams.get(3);
+        assertThat(last.requested.get()).as("the queue is full").isEqualTo(0);
+
+        assertThat(sequenceNumber(subscription.nextEvent())).isEqualTo("1");
+        assertThat(last.requested.get()).isEqualTo(1);
+        assertThat(sequenceNumber(subscription.nextEvent())).isEqualTo("2");
+        assertThat(last.requested.get()).isEqualTo(2);
+        assertThat(subscription.nextEvent()).isNull();
+    }
+
+    @Test
     void eventsOfAReplacedStreamAreDroppedAndItsSubscriptionCancelled() throws Exception {
         ControlledProxy proxy = new ControlledProxy();
         FanOutKinesisShardSubscription subscription = subscriptionOn(proxy);
@@ -277,7 +308,8 @@ class FanOutKinesisShardSubscriptionTest {
         first.subscriber.onComplete();
         eventually(() -> proxy.streams.size() == 2, "the second subscribe call");
         Stream second = proxy.streams.get(1);
-        eventually(() -> second.requested.get() == 2, "the second stream's requests");
+        // one batch is still queued from the first stream, so there is room for one more
+        eventually(() -> second.requested.get() == 1, "the second stream's request");
 
         // A late delivery of the first stream, then a normal one of the second.
         first.deliver("stale");
